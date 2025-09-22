@@ -64,6 +64,9 @@ if(EXISTS "${CMAKE_SOURCE_DIR}/conf/config.cmake")
     include(conf/config.cmake)
 endif()
 
+# 添加 GCC 标准库路径
+include_directories(/usr/include/c++/7)
+
 #
 # Loading dyn modules
 #
@@ -106,7 +109,33 @@ include(ConfigInstall)
 CU_RUN_HOOK("AFTER_LOAD_CMAKE_MODULES")
 
 find_package(PCHSupport)
+
+# 手动设置MySQL路径（避免mysql_config问题）
+set(MYSQL_INCLUDE_DIR "/usr/include/mysql" CACHE PATH "MySQL include directory")
+set(MYSQL_LIBRARY "/usr/lib64/mysql/libmysqlclient.so" CACHE FILEPATH "MySQL client library")
+set(MYSQL_CONFIG_PREFER_PATH "/usr/lib64/mysql" CACHE FILEPATH "preferred path to MySQL (mysql_config)")
+set(MYSQL_ROOT_DIR "/usr" CACHE PATH "MySQL root directory")
+
+# 验证MySQL文件存在
+if(NOT EXISTS "${MYSQL_INCLUDE_DIR}/mysql.h")
+    message(FATAL_ERROR "MySQL header file not found at ${MYSQL_INCLUDE_DIR}/mysql.h")
+endif()
+
+if(NOT EXISTS "${MYSQL_LIBRARY}")
+    message(FATAL_ERROR "MySQL library not found at ${MYSQL_LIBRARY}")
+endif()
+
+# 查找MySQL包
 find_package(MySQL REQUIRED)
+
+# 全局设置Boost路径 - 确保使用1.66版本
+if(EXISTS "/usr/local/boost-1.66")
+  set(BOOST_ROOT "/usr/local/boost-1.66" CACHE PATH "Boost root directory")
+  set(Boost_ROOT "/usr/local/boost-1.66" CACHE PATH "Boost root directory")
+  set(BOOST_INCLUDEDIR "/usr/local/boost-1.66/include" CACHE PATH "Boost include directory")
+  set(BOOST_LIBRARYDIR "/usr/local/boost-1.66/lib" CACHE PATH "Boost library directory")
+  message(STATUS "Global Boost configuration: Using Boost 1.66 at ${BOOST_ROOT}")
+endif()
 
 if(UNIX AND WITH_PERFTOOLS)
     find_package(Gperftools)

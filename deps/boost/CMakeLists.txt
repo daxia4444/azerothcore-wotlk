@@ -24,11 +24,22 @@ set(Boost_NO_WARN_NEW_VERSIONS ON)
 
 include (CheckCXXSourceCompiles)
 
+# 设置Boost路径 - 优先使用我们安装的1.66版本
+if(EXISTS "/usr/local/boost-1.66")
+  set(BOOST_ROOT "/usr/local/boost-1.66")
+  set(Boost_ROOT "/usr/local/boost-1.66")
+  set(BOOST_INCLUDEDIR "/usr/local/boost-1.66/include")
+  set(BOOST_LIBRARYDIR "/usr/local/boost-1.66/lib")
+  set(Boost_INCLUDE_DIR "/usr/local/boost-1.66/include")
+  set(Boost_LIBRARY_DIR "/usr/local/boost-1.66/lib")
+  message(STATUS "Using custom Boost installation at: ${BOOST_ROOT}")
+endif()
+
 if (WIN32)
   # On windows the requirements are higher according to the wiki.
   set(BOOST_REQUIRED_VERSION 1.78)
 else()
-  set(BOOST_REQUIRED_VERSION 1.74)
+  set(BOOST_REQUIRED_VERSION 1.66)
 endif()
 
 find_package(Boost ${BOOST_REQUIRED_VERSION} REQUIRED system filesystem program_options iostreams regex)

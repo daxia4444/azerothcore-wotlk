@@ -51,7 +51,7 @@ set(_MYSQL_ROOT_HINTS
   ENV MYSQL_ROOT_DIR
 )
 
-set(MYSQL_MINIMUM_VERSION "8.0")
+set(MYSQL_MINIMUM_VERSION "5.5")
 
 function(check_mysql_version)
   if(MYSQL_CONFIG)
