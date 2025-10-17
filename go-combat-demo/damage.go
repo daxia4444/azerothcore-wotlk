@@ -5,6 +5,24 @@ import (
 	"math/rand"
 )
 
+// 伤害类型常量 - 基于AzerothCore的定义
+const (
+	// 攻击命中类型
+	MELEE_HIT_NORMAL       = 0x00000000 // 普通命中
+	MELEE_HIT_GLANCING     = 0x00000001 // 偏斜一击
+	MELEE_HIT_CRITICAL     = 0x00000002 // 暴击
+	MELEE_HIT_MISS         = 0x00000004 // 未命中
+	MELEE_HIT_DODGE        = 0x00000008 // 闪避
+	MELEE_HIT_PARRY        = 0x00000010 // 招架
+	MELEE_HIT_BLOCK        = 0x00000020 // 格挡
+	MELEE_HIT_KILLING_BLOW = 0x00000080 // 致命一击
+
+	// 伤害类型
+	DIRECT_DAMAGE       = 0 // 直接伤害
+	SPELL_DIRECT_DAMAGE = 1 // 法术直接伤害
+	NODAMAGE            = 2 // 无伤害
+)
+
 // 伤害处理实现 - 对应AzerothCore的Unit::DealDamage函数
 func (u *Unit) DealDamage(attacker IUnit, damage uint32, damageType int, schoolMask int) uint32 {
 	// 脚本钩子 - 允许修改伤害
@@ -50,23 +68,44 @@ func (u *Unit) DealDamage(attacker IUnit, damage uint32, damageType int, schoolM
 	// 处理死亡
 	if u.health <= damage {
 		fmt.Printf("致命伤害: %s 即将死亡\n", u.name)
+
+		// 死亡前也要广播最后的伤害状态
+		if u.world != nil && attacker != nil {
+			hitResult := MELEE_HIT_KILLING_BLOW // 致命一击
+			u.world.BroadcastAttackerStateUpdate(attacker, u, damage, hitResult, schoolMask)
+			fmt.Printf("[致命伤害同步] %s 的致命一击已广播\n", attacker.GetName())
+		}
+
 		u.handleDeath(attacker, damageType, schoolMask)
 		return damage
 	}
 
-	// 存活时的伤害处理
+	// 存活时的伤害处理 - 这里会触发血量同步
+	oldHealth := u.health
 	u.ModifyHealth(-int32(damage))
+	newHealth := u.health
+
+	// 确保血量变化被正确记录用于同步
+	if oldHealth != newHealth {
+		fmt.Printf("[血量同步] %s 血量变化: %d -> %d\n", u.GetName(), oldHealth, newHealth)
+	}
 
 	// 移除因直接伤害中断的光环（简化版）
 	if damageType == DIRECT_DAMAGE || damageType == SPELL_DIRECT_DAMAGE {
 		u.removeDirectDamageAuras()
 	}
 
-	// 网络广播伤害信息 - 基于AzerothCore的网络同步
+	// 🔥 关键：网络广播伤害信息 - 基于AzerothCore的SMSG_ATTACKERSTATEUPDATE
 	if u.world != nil && attacker != nil {
 		hitResult := MELEE_HIT_NORMAL // 简化处理，实际应该根据攻击类型确定
+
+		// 立即广播攻击状态更新 - 这是伤害同步到客户端的关键位置！
 		u.world.BroadcastAttackerStateUpdate(attacker, u, damage, hitResult, schoolMask)
-		// 注意：血量更新已经在ModifyHealth中自动广播了
+
+		// 注意：血量更新会在ModifyHealth中自动广播
+		// 但攻击状态更新必须在这里立即发送，确保客户端看到伤害数字
+		fmt.Printf("[伤害同步] %s 对 %s 造成 %d 伤害，已广播给所有相关玩家\n",
+			attacker.GetName(), u.GetName(), damage)
 	}
 
 	// 更新威胁值

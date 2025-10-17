@@ -45,12 +45,9 @@ const (
 	OFF_ATTACK    = 1 // 副手攻击 - 副手武器攻击(双持)
 	RANGED_ATTACK = 2 // 远程攻击 - 弓箭、枪械、法杖攻击
 
-	// 伤害类型 - 伤害的来源和性质
-	DIRECT_DAMAGE       = 0 // 直接伤害 - 立即造成的伤害
-	SPELL_DIRECT_DAMAGE = 1 // 法术直接伤害 - 法术造成的即时伤害
-	DOT                 = 2 // 持续伤害 - 毒素、燃烧等持续效果
-	HEAL                = 3 // 治疗效果 - 恢复生命值
-	NODAMAGE            = 4 // 无伤害 - 纯粹的效果，不造成伤害
+	// 伤害类型 - 伤害的来源和性质（主要定义在damage.go中）
+	DOT  = 3 // 持续伤害 - 毒素、燃烧等持续效果
+	HEAL = 4 // 治疗效果 - 恢复生命值
 
 	// 法术学派 - 魔法伤害的类型，影响抗性计算(位掩码)
 	SPELL_SCHOOL_NORMAL = 1  // 物理伤害 - 武器攻击等物理伤害
@@ -99,15 +96,9 @@ const (
 	// 战斗距离 - 近战攻击的有效范围(码)
 	MIN_MELEE_REACH = 1.5 // 最小近战范围 - 近战攻击的最小距离
 
-	// 命中结果 - 攻击的各种可能结果
-	MELEE_HIT_NORMAL   = 0 // 普通命中 - 正常造成伤害
-	MELEE_HIT_MISS     = 1 // 未命中 - 攻击完全落空
-	MELEE_HIT_CRIT     = 2 // 暴击 - 造成额外伤害(通常2倍)
-	MELEE_HIT_DODGE    = 3 // 闪避 - 目标敏捷地避开攻击
-	MELEE_HIT_PARRY    = 4 // 招架 - 目标用武器格挡攻击
-	MELEE_HIT_BLOCK    = 5 // 格挡 - 目标用盾牌阻挡攻击，减少伤害
-	MELEE_HIT_GLANCING = 6 // 偏斜 - 攻击角度不佳，伤害降低
+	// 命中结果 - 攻击的各种可能结果（主要定义在damage.go中）
 	MELEE_HIT_CRUSHING = 7 // 碾压 - 高等级对低等级的强力攻击
+
 )
 
 // 基础单位接口
@@ -127,11 +118,11 @@ type IUnit interface {
 	IsAlive() bool
 
 	// 能量值
-	GetPower(powerType int) uint32
-	GetMaxPower(powerType int) uint32
-	SetPower(powerType int, power uint32)
-	SetMaxPower(powerType int, maxPower uint32)
-	ModifyPower(powerType int, delta int32) int32
+	GetPower(powerType uint8) uint32
+	GetMaxPower(powerType uint8) uint32
+	SetPower(powerType uint8, power uint32)
+	SetMaxPower(powerType uint8, maxPower uint32)
+	ModifyPower(powerType uint8, delta int32) int32
 
 	// 战斗相关
 	IsInCombat() bool
@@ -151,6 +142,7 @@ type IUnit interface {
 	GetX() float32
 	GetY() float32
 	GetZ() float32
+	GetPosition() (float32, float32, float32) // 新增：获取位置坐标
 	GetDistanceTo(target IUnit) float32
 	IsWithinMeleeRange(target IUnit) bool
 
@@ -194,12 +186,13 @@ type Unit struct {
 	health    uint32 // 当前生命值，降到0时单位死亡
 	maxHealth uint32 // 最大生命值，生命值上限
 
-	// 能量值系统 (法力、怒气、集中值、能量等)
-	powers    map[int]uint32 // 当前各种能量值，key为能量类型(POWER_MANA等)
-	maxPowers map[int]uint32 // 各种能量值的上限
+	// 能量值系统 - 不同职业使用不同的能量类型(法力、怒气、能量、集中值)
+	powers    map[uint8]uint32 // 当前各种能量值(法力、怒气、能量、集中值)
+	maxPowers map[uint8]uint32 // 各种能量值的上限
 
 	// 3D世界坐标位置
-	x, y, z float32 // 单位在游戏世界中的三维坐标，用于距离计算和移动
+	x, y, z     float32 // 单位在游戏世界中的三维坐标，用于距离计算和移动
+	orientation float32 // 单位朝向，用于移动和攻击方向
 
 	// 战斗状态管理
 	inCombat    bool             // 是否处于战斗状态，影响回血回蓝和其他机制
@@ -233,8 +226,8 @@ func NewUnit(guid uint64, name string, level uint8, unitType int) *Unit {
 		name:           name,
 		level:          level,
 		unitType:       unitType,
-		powers:         make(map[int]uint32),
-		maxPowers:      make(map[int]uint32),
+		powers:         make(map[uint8]uint32),
+		maxPowers:      make(map[uint8]uint32),
 		attackers:      make(map[uint64]IUnit),
 		attackTimer:    make(map[int]int32),
 		threatManager:  NewThreatManager(),
@@ -269,8 +262,16 @@ func (u *Unit) SetHealth(health uint32) {
 	// 网络同步 - 基于AzerothCore的即时血量同步
 	if u.world != nil && oldHealth != u.health {
 		u.world.BroadcastHealthUpdate(u, oldHealth, u.health)
+
+		// 添加到批量更新 - 基于AzerothCore的UpdateData机制
+		updateBlock := u.buildHealthUpdateBlock(oldHealth, u.health)
+		players := u.world.GetPlayersInRange(u.x, u.y, u.z, 100.0)
+		for _, player := range players {
+			u.world.AddBatchUpdate(u, player.id, updateBlock)
+		}
 	}
 }
+
 func (u *Unit) SetMaxHealth(maxHealth uint32) { u.maxHealth = maxHealth }
 
 func (u *Unit) ModifyHealth(delta int32) int32 {
@@ -302,21 +303,21 @@ func (u *Unit) IsAlive() bool {
 	return u.health > 0
 }
 
-func (u *Unit) GetPower(powerType int) uint32 {
+func (u *Unit) GetPower(powerType uint8) uint32 {
 	if power, exists := u.powers[powerType]; exists {
 		return power
 	}
 	return 0
 }
 
-func (u *Unit) GetMaxPower(powerType int) uint32 {
+func (u *Unit) GetMaxPower(powerType uint8) uint32 {
 	if maxPower, exists := u.maxPowers[powerType]; exists {
 		return maxPower
 	}
 	return 0
 }
 
-func (u *Unit) SetPower(powerType int, power uint32) {
+func (u *Unit) SetPower(powerType uint8, power uint32) {
 	oldPower := u.GetPower(powerType)
 	maxPower := u.GetMaxPower(powerType)
 	if power > maxPower {
@@ -327,14 +328,21 @@ func (u *Unit) SetPower(powerType int, power uint32) {
 	// 网络同步 - 基于AzerothCore的SMSG_POWER_UPDATE
 	if u.world != nil && oldPower != power {
 		u.world.BroadcastPowerUpdate(u, powerType, oldPower, power)
+
+		// 添加到批量更新 - 基于AzerothCore的UpdateData机制
+		updateBlock := u.buildPowerUpdateBlock(powerType, oldPower, power)
+		players := u.world.GetPlayersInRange(u.x, u.y, u.z, 100.0)
+		for _, player := range players {
+			u.world.AddBatchUpdate(u, player.id, updateBlock)
+		}
 	}
 }
 
-func (u *Unit) SetMaxPower(powerType int, maxPower uint32) {
+func (u *Unit) SetMaxPower(powerType uint8, maxPower uint32) {
 	u.maxPowers[powerType] = maxPower
 }
 
-func (u *Unit) ModifyPower(powerType int, delta int32) int32 {
+func (u *Unit) ModifyPower(powerType uint8, delta int32) int32 {
 	oldPower := int32(u.GetPower(powerType))
 	newPower := oldPower + delta
 	maxPower := int32(u.GetMaxPower(powerType))
@@ -381,6 +389,17 @@ func (u *Unit) SetVictim(victim IUnit) {
 func (u *Unit) GetX() float32 { return u.x }
 func (u *Unit) GetY() float32 { return u.y }
 func (u *Unit) GetZ() float32 { return u.z }
+
+func (u *Unit) GetPosition() (float32, float32, float32) {
+	return u.x, u.y, u.z
+}
+
+// SetPosition 设置单位位置
+func (u *Unit) SetPosition(x, y, z float32) {
+	u.x = x
+	u.y = y
+	u.z = z
+}
 
 func (u *Unit) GetDistanceTo(target IUnit) float32 {
 	dx := u.x - target.GetX()
@@ -566,7 +585,8 @@ func (u *Unit) performMeleeAttack(target IUnit) {
 	case MELEE_HIT_BLOCK:
 		damage = damage / 2 // 格挡减少50%伤害
 		fmt.Printf("%s 攻击 %s 被格挡，伤害减少\n", u.name, target.GetName())
-	case MELEE_HIT_CRIT:
+	case MELEE_HIT_CRITICAL:
+
 		damage = damage * 2 // 暴击双倍伤害
 		fmt.Printf("%s 对 %s 造成暴击！\n", u.name, target.GetName())
 	}
@@ -635,7 +655,8 @@ func (u *Unit) rollMeleeHitResult(target IUnit) int {
 	roll -= blockChance
 
 	if roll < critChance {
-		return MELEE_HIT_CRIT
+		return MELEE_HIT_CRITICAL
+
 	}
 
 	return MELEE_HIT_NORMAL
@@ -655,7 +676,7 @@ func (u *Unit) rewardRage(damage uint32, isAttacker bool) {
 		}
 
 		if rageGain > 0 {
-			u.ModifyPower(POWER_RAGE, int32(rageGain))
+			u.ModifyPower(uint8(POWER_RAGE), int32(rageGain))
 			if rageGain > 1 {
 				fmt.Printf("%s 获得 %d 点怒气\n", u.name, rageGain)
 			}
@@ -842,4 +863,118 @@ func (u *Unit) Heal(caster IUnit, amount uint32) {
 			u.world.BroadcastUnitUpdate(u) // 广播生命值更新
 		}
 	}
+}
+
+// buildHealthUpdateBlock 构建血量更新数据块 - 基于AzerothCore的UpdateData机制
+func (u *Unit) buildHealthUpdateBlock(oldHealth, newHealth uint32) []byte {
+	// 创建一个临时的WorldPacket来构建数据
+	packet := NewWorldPacket(SMSG_HEALTH_UPDATE)
+	packet.WriteUint64(u.guid)      // 单位GUID
+	packet.WriteUint32(oldHealth)   // 旧血量
+	packet.WriteUint32(newHealth)   // 新血量
+	packet.WriteUint32(u.maxHealth) // 最大血量
+
+	// 返回数据块
+	return packet.data
+}
+
+// buildPowerUpdateBlock 构建能量更新数据块 - 基于AzerothCore的UpdateData机制
+func (u *Unit) buildPowerUpdateBlock(powerType uint8, oldPower, newPower uint32) []byte {
+	// 创建一个临时的WorldPacket来构建数据
+	packet := NewWorldPacket(SMSG_POWER_UPDATE)
+	packet.WriteUint64(u.guid)                   // 单位GUID
+	packet.WriteUint8(powerType)                 // 能量类型
+	packet.WriteUint32(oldPower)                 // 旧能量值
+	packet.WriteUint32(newPower)                 // 新能量值
+	packet.WriteUint32(u.GetMaxPower(powerType)) // 最大能量值
+
+	// 返回数据块
+	return packet.data
+}
+
+// buildPositionUpdateBlock 构建位置更新数据块 - 基于AzerothCore的移动同步
+func (u *Unit) buildPositionUpdateBlock() []byte {
+	packet := NewWorldPacket(SMSG_UPDATE_OBJECT)
+	packet.WriteUint64(u.guid)         // 单位GUID
+	packet.WriteFloat32(u.x)           // X坐标
+	packet.WriteFloat32(u.y)           // Y坐标
+	packet.WriteFloat32(u.z)           // Z坐标
+	packet.WriteFloat32(u.orientation) // 朝向
+
+	return packet.data
+}
+
+// buildFullUpdateBlock 构建完整状态更新数据块 - 基于AzerothCore的完整对象更新
+func (u *Unit) buildFullUpdateBlock() []byte {
+	packet := NewWorldPacket(SMSG_UPDATE_OBJECT)
+	packet.WriteUint64(u.guid)      // 单位GUID
+	packet.WriteUint32(u.health)    // 当前血量
+	packet.WriteUint32(u.maxHealth) // 最大血量
+
+	// 写入所有能量类型
+	for powerType := uint8(0); powerType < 4; powerType++ {
+		packet.WriteUint32(u.GetPower(powerType))    // 当前能量
+		packet.WriteUint32(u.GetMaxPower(powerType)) // 最大能量
+	}
+
+	// 写入位置信息
+	packet.WriteFloat32(u.x)
+	packet.WriteFloat32(u.y)
+	packet.WriteFloat32(u.z)
+	packet.WriteFloat32(u.orientation)
+
+	// 写入状态标志
+	packet.WriteUint32(u.getUnitFlags())
+
+	return packet.data
+}
+
+// getUnitFlags 获取单位状态标志 - 基于AzerothCore的UnitFlags
+func (u *Unit) getUnitFlags() uint32 {
+	flags := uint32(0)
+
+	if !u.IsAlive() {
+		flags |= 0x00000001 // UNIT_FLAG_DEAD
+	}
+
+	if u.IsInCombat() {
+		flags |= 0x00080000 // UNIT_FLAG_IN_COMBAT
+	}
+
+	// 可以根据需要添加更多标志
+	return flags
+}
+
+// AddBatchUpdateForMovement 为移动添加批量更新 - 基于AzerothCore的移动同步
+func (u *Unit) AddBatchUpdateForMovement() {
+	if u.world == nil {
+		return
+	}
+
+	// 构建位置更新数据块
+	updateBlock := u.buildPositionUpdateBlock()
+
+	// 获取范围内的玩家会话
+	players := u.world.GetPlayersInRange(u.x, u.y, u.z, 100.0)
+	for _, player := range players {
+		u.world.AddBatchUpdate(u, player.id, updateBlock)
+	}
+}
+
+// AddBatchUpdateForFullState 为完整状态添加批量更新 - 基于AzerothCore的完整对象同步
+func (u *Unit) AddBatchUpdateForFullState() {
+	if u.world == nil {
+		return
+	}
+
+	// 构建完整状态更新数据块
+	updateBlock := u.buildFullUpdateBlock()
+
+	// 获取范围内的玩家会话
+	players := u.world.GetPlayersInRange(u.x, u.y, u.z, 100.0)
+	for _, player := range players {
+		u.world.AddBatchUpdate(u, player.id, updateBlock)
+	}
+
+	fmt.Printf("[BatchUpdate] 完整状态更新: %s (范围: %d玩家)\n", u.name, len(players))
 }

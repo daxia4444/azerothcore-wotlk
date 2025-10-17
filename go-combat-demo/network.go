@@ -3,8 +3,10 @@ package main
 import (
 	"encoding/binary"
 	"fmt"
+	"math"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -20,21 +22,23 @@ const (
 	CMSG_MOVE_START_FORWARD = 0x0B1 // 开始前进
 	CMSG_MOVE_STOP          = 0x0B7 // 停止移动
 	CMSG_KEEP_ALIVE         = 0x406 // 保持连接
+	CMSG_DAMAGE_TAKEN       = 0x200 // 自定义：客户端报告受到伤害
 
 	// 服务器到客户端的操作码 (SMSG)
-	SMSG_ATTACKSTART         = 0x143 // 攻击开始
-	SMSG_ATTACKSTOP          = 0x144 // 攻击停止
-	SMSG_ATTACKERSTATEUPDATE = 0x14A // 攻击者状态更新
-	SMSG_SPELL_START         = 0x131 // 法术开始
-	SMSG_SPELLGO             = 0x132 // 法术施放
-	SMSG_SPELL_FAILURE       = 0x133 // 法术失败
-	SMSG_SPELL_COOLDOWN      = 0x134 // 法术冷却
-	SMSG_AURA_UPDATE         = 0x495 // 光环更新
-	SMSG_UPDATE_OBJECT       = 0x0A9 // 对象更新
-	SMSG_POWER_UPDATE        = 0x480 // 能量更新 - 基于AzerothCore
-	SMSG_HEALTH_UPDATE       = 0x481 // 血量更新 - 自定义消息
-	SMSG_SPELL_HEAL_LOG      = 0x150 // 治疗日志
-	SMSG_SPELL_ENERGIZE_LOG  = 0x151 // 能量恢复日志
+	SMSG_ATTACKSTART              = 0x143 // 攻击开始
+	SMSG_ATTACKSTOP               = 0x144 // 攻击停止
+	SMSG_ATTACKERSTATEUPDATE      = 0x14A // 攻击者状态更新
+	SMSG_SPELL_START              = 0x131 // 法术开始
+	SMSG_SPELLGO                  = 0x132 // 法术施放
+	SMSG_SPELL_FAILURE            = 0x133 // 法术失败
+	SMSG_SPELL_COOLDOWN           = 0x134 // 法术冷却
+	SMSG_AURA_UPDATE              = 0x495 // 光环更新
+	SMSG_UPDATE_OBJECT            = 0x0A9 // 对象更新
+	SMSG_POWER_UPDATE             = 0x480 // 能量更新 - 基于AzerothCore
+	SMSG_HEALTH_UPDATE            = 0x481 // 血量更新 - 自定义消息
+	SMSG_SPELL_HEAL_LOG           = 0x150 // 治疗日志
+	SMSG_SPELL_ENERGIZE_LOG       = 0x151 // 能量恢复日志
+	SMSG_COMPRESSED_UPDATE_OBJECT = 0x1F6 // 压缩的对象更新
 )
 
 // 数据包处理类型 - 基于AzerothCore的PacketProcessing
@@ -52,21 +56,33 @@ const (
 	STATUS_LOGGEDIN  = 3 // 已登录
 )
 
-// WorldPacket - 基于AzerothCore的WorldPacket
+// WorldPacket - 基于AzerothCore的WorldPacket，增加时序控制
 type WorldPacket struct {
-	opcode uint16 // 操作码
-	data   []byte // 数据
-	rpos   int    // 读取位置
-	wpos   int    // 写入位置
+	opcode    uint16    // 操作码
+	data      []byte    // 数据
+	rpos      int       // 读取位置
+	wpos      int       // 写入位置
+	sequence  uint32    // 序列号 - 确保数据包顺序
+	timestamp time.Time // 时间戳 - 用于时序验证
+	priority  uint8     // 优先级 - 0=立即, 1=高, 2=普通, 3=低
+	updateId  uint32    // 更新ID - 用于版本控制
 }
 
 // NewWorldPacket 创建新的数据包
+// 全局序列号生成器
+var globalSequence uint32 = 0
+var globalUpdateId uint32 = 0
+
 func NewWorldPacket(opcode uint16) *WorldPacket {
 	return &WorldPacket{
-		opcode: opcode,
-		data:   make([]byte, 0, 1024),
-		rpos:   0,
-		wpos:   0,
+		opcode:    opcode,
+		data:      make([]byte, 0, 1024),
+		rpos:      0,
+		wpos:      0,
+		sequence:  atomic.AddUint32(&globalSequence, 1),
+		timestamp: time.Now(),
+		priority:  2, // 默认普通优先级
+		updateId:  atomic.AddUint32(&globalUpdateId, 1),
 	}
 }
 
@@ -81,6 +97,12 @@ func (wp *WorldPacket) WriteUint32(val uint32) {
 	binary.LittleEndian.PutUint32(buf, val)
 	wp.data = append(wp.data, buf...)
 	wp.wpos += 4
+}
+
+// WriteUint8 写入8位整数
+func (wp *WorldPacket) WriteUint8(val uint8) {
+	wp.data = append(wp.data, byte(val))
+	wp.wpos += 1
 }
 
 // WriteUint64 写入64位整数
@@ -98,6 +120,14 @@ func (wp *WorldPacket) WriteString(str string) {
 	wp.wpos += len(str) + 1
 }
 
+// WriteFloat32 写入32位浮点数
+func (wp *WorldPacket) WriteFloat32(val float32) {
+	buf := make([]byte, 4)
+	binary.LittleEndian.PutUint32(buf, math.Float32bits(val))
+	wp.data = append(wp.data, buf...)
+	wp.wpos += 4
+}
+
 // ReadUint32 读取32位整数
 func (wp *WorldPacket) ReadUint32() uint32 {
 	if wp.rpos+4 > len(wp.data) {
@@ -106,6 +136,16 @@ func (wp *WorldPacket) ReadUint32() uint32 {
 	val := binary.LittleEndian.Uint32(wp.data[wp.rpos:])
 	wp.rpos += 4
 	return val
+}
+
+// ReadFloat32 读取32位浮点数
+func (wp *WorldPacket) ReadFloat32() float32 {
+	if wp.rpos+4 > len(wp.data) {
+		return 0.0
+	}
+	bits := binary.LittleEndian.Uint32(wp.data[wp.rpos:])
+	wp.rpos += 4
+	return math.Float32frombits(bits)
 }
 
 // ReadUint64 读取64位整数
@@ -126,6 +166,68 @@ func (wp *WorldPacket) GetData() []byte {
 // Size 获取数据大小
 func (wp *WorldPacket) Size() int {
 	return len(wp.data)
+}
+
+// 🔥 关键：数据包时序控制方法 - 基于AzerothCore的时序机制
+
+// SetPriority 设置数据包优先级
+func (wp *WorldPacket) SetPriority(priority uint8) {
+	wp.priority = priority
+}
+
+// SetUpdateId 设置更新ID（用于版本控制）
+func (wp *WorldPacket) SetUpdateId(updateId uint32) {
+	wp.updateId = updateId
+}
+
+// GetSequence 获取序列号
+func (wp *WorldPacket) GetSequence() uint32 {
+	return wp.sequence
+}
+
+// GetTimestamp 获取时间戳
+func (wp *WorldPacket) GetTimestamp() time.Time {
+	return wp.timestamp
+}
+
+// GetPriority 获取优先级
+func (wp *WorldPacket) GetPriority() uint8 {
+	return wp.priority
+}
+
+// GetUpdateId 获取更新ID
+func (wp *WorldPacket) GetUpdateId() uint32 {
+	return wp.updateId
+}
+
+// IsNewerThan 检查是否比另一个数据包更新
+func (wp *WorldPacket) IsNewerThan(other *WorldPacket) bool {
+	// 首先比较更新ID
+	if wp.updateId != other.updateId {
+		return wp.updateId > other.updateId
+	}
+	// 然后比较时间戳
+	return wp.timestamp.After(other.timestamp)
+}
+
+// ShouldOverride 检查是否应该覆盖另一个数据包
+func (wp *WorldPacket) ShouldOverride(other *WorldPacket) bool {
+	// 相同操作码才能覆盖
+	if wp.opcode != other.opcode {
+		return false
+	}
+
+	// 高优先级可以覆盖低优先级
+	if wp.priority < other.priority {
+		return true
+	}
+
+	// 相同优先级时，比较更新ID和时间戳
+	if wp.priority == other.priority {
+		return wp.IsNewerThan(other)
+	}
+
+	return false
 }
 
 // OpcodeHandler 操作码处理器接口
@@ -226,6 +328,29 @@ func (ot *OpcodeTable) Initialize() {
 		processing: PROCESS_INPLACE,
 		handler:    (*WorldSession).HandleKeepAliveOpcode,
 	})
+
+	ot.RegisterHandler(CMSG_DAMAGE_TAKEN, &ClientOpcodeHandler{
+		name:       "CMSG_DAMAGE_TAKEN",
+		status:     STATUS_LOGGEDIN,
+		processing: PROCESS_THREADSAFE,
+		handler:    (*WorldSession).HandleDamageTakenOpcode,
+	})
+
+	// 注册移动相关操作码 - 基于AzerothCore的移动系统
+	ot.RegisterHandler(CMSG_MOVE_START_FORWARD, &ClientOpcodeHandler{
+		name:       "CMSG_MOVE_START_FORWARD",
+		status:     STATUS_LOGGEDIN,
+		processing: PROCESS_THREADSAFE,
+		handler:    (*WorldSession).HandleMoveStartForwardOpcode,
+	})
+
+	ot.RegisterHandler(CMSG_MOVE_STOP, &ClientOpcodeHandler{
+		name:       "CMSG_MOVE_STOP",
+		status:     STATUS_LOGGEDIN,
+		processing: PROCESS_THREADSAFE,
+		handler:    (*WorldSession).HandleMoveStopOpcode,
+	})
+
 }
 
 // RegisterHandler 注册处理器
@@ -274,7 +399,8 @@ func (ws *WorldSocket) SetSession(session *WorldSession) {
 	ws.session = session
 }
 
-// SendPacket 发送数据包
+// SendPacket 发送数据包（单个广播）
+// 注意：此方法将数据包加入发送队列，不会立即发送
 func (ws *WorldSocket) SendPacket(packet *WorldPacket) {
 	if ws.closed {
 		return
@@ -287,6 +413,22 @@ func (ws *WorldSocket) SendPacket(packet *WorldPacket) {
 	}
 }
 
+// BatchSendPackets 批量发送数据包（批量广播）
+// 注意：此方法用于批量发送多个数据包，减少网络开销
+func (ws *WorldSocket) BatchSendPackets(packets []*WorldPacket) {
+	if ws.closed {
+		return
+	}
+
+	for _, packet := range packets {
+		select {
+		case ws.sendQueue <- packet:
+		default:
+			fmt.Printf("发送队列已满，丢弃数据包: %d\n", packet.GetOpcode())
+		}
+	}
+}
+
 // QueuePacket 队列数据包
 // QueuePacket 将数据包加入WorldSession的接收队列 - 基于AzerothCore的逻辑
 func (ws *WorldSocket) QueuePacket(packet *WorldPacket) {
@@ -296,6 +438,16 @@ func (ws *WorldSocket) QueuePacket(packet *WorldPacket) {
 
 	// 将数据包加入WorldSession的队列，而不是直接处理
 	ws.session.QueuePacket(packet)
+}
+
+// QueueReceivedPacket 将服务器发送的数据包加入客户端接收队列
+func (ws *WorldSocket) QueueReceivedPacket(packet *WorldPacket) {
+	if ws.closed || ws.session == nil {
+		return
+	}
+
+	// 将服务器发送的数据包加入客户端接收队列
+	ws.session.QueueReceivedPacket(packet)
 }
 
 // Close 关闭套接字
@@ -390,42 +542,62 @@ func (ws *WorldSocket) IsOpen() bool {
 type WorldSession struct {
 	id          uint32
 	accountName string
-	player      *Player
+	player      IUnit
 	socket      *WorldSocket
+
 	opcodeTable *OpcodeTable
 	lastUpdate  time.Time
 	timeoutTime time.Time
 	mutex       sync.RWMutex
 	world       *World
 	_recvQueue  chan *WorldPacket // 接收数据包队列，基于AzerothCore的_recvQueue
+	// 客户端接收到的数据包队列（用于客户端处理）
+	_receivedQueue chan *WorldPacket
+
+	// 🔥 关键：数据包时序控制 - 基于AzerothCore的时序机制
+	lastSequence     uint32                  // 最后处理的序列号
+	pendingPackets   map[uint32]*WorldPacket // 待排序的数据包
+	lastUpdateStates map[uint16]uint32       // 每种操作码的最后更新ID
+	packetBuffer     []*WorldPacket          // 数据包缓冲区
+	sortMutex        sync.Mutex              // 排序锁
 }
 
 // NewWorldSession 创建世界会话
 func NewWorldSession(id uint32, accountName string, socket *WorldSocket, world *World) *WorldSession {
 	session := &WorldSession{
-		id:          id,
-		accountName: accountName,
-		socket:      socket,
-		opcodeTable: NewOpcodeTable(),
-		lastUpdate:  time.Now(),
-		timeoutTime: time.Now().Add(60 * time.Second), // 60秒超时
-		world:       world,
-		_recvQueue:  make(chan *WorldPacket, 200), // 基于AzerothCore的接收队列
+		id:             id,
+		accountName:    accountName,
+		socket:         socket,
+		opcodeTable:    NewOpcodeTable(),
+		lastUpdate:     time.Now(),
+		timeoutTime:    time.Now().Add(60 * time.Second), // 60秒超时
+		world:          world,
+		_recvQueue:     make(chan *WorldPacket, 200), // 基于AzerothCore的接收队列
+		_receivedQueue: make(chan *WorldPacket, 100), // 客户端接收队列
+
+		// 🔥 关键：初始化时序控制字段
+		lastSequence:     0,
+		pendingPackets:   make(map[uint32]*WorldPacket),
+		lastUpdateStates: make(map[uint16]uint32),
+		packetBuffer:     make([]*WorldPacket, 0, 50),
 	}
 
-	socket.SetSession(session)
+	if socket != nil {
+		socket.SetSession(session)
+	}
 	return session
+
 }
 
 // GetPlayer 获取玩家
-func (ws *WorldSession) GetPlayer() *Player {
+func (ws *WorldSession) GetPlayer() IUnit {
 	ws.mutex.RLock()
 	defer ws.mutex.RUnlock()
 	return ws.player
 }
 
 // SetPlayer 设置玩家
-func (ws *WorldSession) SetPlayer(player *Player) {
+func (ws *WorldSession) SetPlayer(player IUnit) {
 	ws.mutex.Lock()
 	defer ws.mutex.Unlock()
 	ws.player = player
@@ -435,10 +607,13 @@ func (ws *WorldSession) SetPlayer(player *Player) {
 func (ws *WorldSession) SendPacket(packet *WorldPacket) {
 	if ws.socket != nil {
 		ws.socket.SendPacket(packet)
+		// 同时将数据包加入客户端接收队列（模拟客户端接收）
+		ws.socket.QueueReceivedPacket(packet)
 	}
 }
 
 // Update 更新会话 - 基于AzerothCore的WorldSession::Update
+// 注意：此方法实现了批量处理接收队列中的数据包，优化性能
 func (ws *WorldSession) Update(diff uint32) bool {
 	// 检查超时
 	if time.Now().After(ws.timeoutTime) {
@@ -470,6 +645,110 @@ func (ws *WorldSession) Update(diff uint32) bool {
 
 	ws.lastUpdate = time.Now()
 	return true
+}
+
+// 🔥 关键：数据包时序控制方法 - 基于AzerothCore的时序机制
+
+// SendPacketOrdered 发送有序数据包
+func (ws *WorldSession) SendPacketOrdered(packet *WorldPacket) {
+	ws.sortMutex.Lock()
+	defer ws.sortMutex.Unlock()
+
+	// 检查是否应该覆盖现有的数据包
+	if ws.shouldOverridePacket(packet) {
+		ws.removeOldPackets(packet.opcode, packet.updateId)
+	}
+
+	// 更新最后的更新状态
+	ws.lastUpdateStates[packet.opcode] = packet.updateId
+
+	// 发送数据包
+	if ws.socket != nil {
+		ws.socket.SendPacket(packet)
+		ws.socket.QueueReceivedPacket(packet)
+	}
+}
+
+// shouldOverridePacket 检查是否应该覆盖现有数据包
+func (ws *WorldSession) shouldOverridePacket(newPacket *WorldPacket) bool {
+	lastUpdateId, exists := ws.lastUpdateStates[newPacket.opcode]
+	if !exists {
+		return false
+	}
+
+	// 如果新数据包的更新ID更大，则应该覆盖
+	return newPacket.updateId > lastUpdateId
+}
+
+// removeOldPackets 移除旧的数据包
+func (ws *WorldSession) removeOldPackets(opcode uint16, newUpdateId uint32) {
+	// 从缓冲区中移除旧的相同类型数据包
+	filteredBuffer := make([]*WorldPacket, 0, len(ws.packetBuffer))
+	for _, packet := range ws.packetBuffer {
+		if packet.opcode != opcode || packet.updateId >= newUpdateId {
+			filteredBuffer = append(filteredBuffer, packet)
+		}
+	}
+	ws.packetBuffer = filteredBuffer
+}
+
+// SortAndSendPackets 排序并发送数据包
+func (ws *WorldSession) SortAndSendPackets(packets []*WorldPacket) {
+	if len(packets) == 0 {
+		return
+	}
+
+	ws.sortMutex.Lock()
+	defer ws.sortMutex.Unlock()
+
+	// 按优先级和时间戳排序
+	ws.sortPacketsByPriority(packets)
+
+	// 发送排序后的数据包
+	for _, packet := range packets {
+		if ws.shouldSendPacket(packet) {
+			if ws.socket != nil {
+				ws.socket.SendPacket(packet)
+				ws.socket.QueueReceivedPacket(packet)
+			}
+			ws.lastUpdateStates[packet.opcode] = packet.updateId
+		}
+	}
+}
+
+// sortPacketsByPriority 按优先级排序数据包
+func (ws *WorldSession) sortPacketsByPriority(packets []*WorldPacket) {
+	// 简单的冒泡排序，按优先级和时间戳排序
+	n := len(packets)
+	for i := 0; i < n-1; i++ {
+		for j := 0; j < n-i-1; j++ {
+			if ws.shouldSwapPackets(packets[j], packets[j+1]) {
+				packets[j], packets[j+1] = packets[j+1], packets[j]
+			}
+		}
+	}
+}
+
+// shouldSwapPackets 检查是否应该交换两个数据包的顺序
+func (ws *WorldSession) shouldSwapPackets(a, b *WorldPacket) bool {
+	// 优先级低的数字表示高优先级
+	if a.priority != b.priority {
+		return a.priority > b.priority
+	}
+
+	// 相同优先级时，按时间戳排序
+	return a.timestamp.After(b.timestamp)
+}
+
+// shouldSendPacket 检查是否应该发送数据包
+func (ws *WorldSession) shouldSendPacket(packet *WorldPacket) bool {
+	lastUpdateId, exists := ws.lastUpdateStates[packet.opcode]
+	if !exists {
+		return true
+	}
+
+	// 只发送更新的数据包
+	return packet.updateId > lastUpdateId
 }
 
 // processPackets 处理数据包 - 已废弃，使用ProcessIncomingPackets()替代
@@ -528,6 +807,12 @@ func (ws *WorldSession) Close() {
 		close(ws._recvQueue)
 		ws._recvQueue = nil
 	}
+
+	// 关闭客户端接收队列
+	if ws._receivedQueue != nil {
+		close(ws._receivedQueue)
+		ws._receivedQueue = nil
+	}
 }
 
 // IsConnected 检查连接是否有效
@@ -570,7 +855,7 @@ func (ws *WorldSession) HandleAttackSwingOpcode(packet *WorldPacket) {
 	}
 
 	// 查找目标
-	target := ws.world.GetUnitByGUID(targetGuid)
+	target := ws.world.GetUnit(targetGuid)
 	if target == nil {
 		// 发送攻击停止
 		ws.SendAttackStop(nil)
@@ -588,6 +873,11 @@ func (ws *WorldSession) HandleAttackSwingOpcode(packet *WorldPacket) {
 
 	// 发送攻击开始确认
 	ws.SendAttackStart(player, target)
+
+	// 添加批量更新 - 基于AzerothCore的攻击状态同步
+	if unit, ok := player.(*Unit); ok {
+		unit.AddBatchUpdateForFullState() // 攻击状态变化需要完整状态更新
+	}
 }
 
 // HandleAttackStopOpcode 处理停止攻击操作码
@@ -597,6 +887,11 @@ func (ws *WorldSession) HandleAttackStopOpcode(packet *WorldPacket) {
 	player := ws.GetPlayer()
 	if player != nil {
 		player.AttackStop()
+
+		// 添加批量更新 - 基于AzerothCore的攻击状态同步
+		if unit, ok := player.(*Unit); ok {
+			unit.AddBatchUpdateForFullState() // 停止攻击状态变化需要完整状态更新
+		}
 	}
 }
 
@@ -608,8 +903,13 @@ func (ws *WorldSession) HandleSetSelectionOpcode(packet *WorldPacket) {
 
 	player := ws.GetPlayer()
 	if player != nil {
-		target := ws.world.GetUnitByGUID(targetGuid)
+		target := ws.world.GetUnit(targetGuid)
 		player.SetTarget(target)
+
+		// 添加批量更新 - 基于AzerothCore的目标选择同步
+		if unit, ok := player.(*Unit); ok {
+			unit.AddBatchUpdateForFullState() // 目标变化需要完整状态更新
+		}
 	}
 }
 
@@ -639,7 +939,7 @@ func (ws *WorldSession) HandleCastSpellOpcode(packet *WorldPacket) {
 	if targetGuid == 0 || targetGuid == player.GetGUID() {
 		target = player // 自己作为目标
 	} else {
-		target = ws.world.GetUnitByGUID(targetGuid)
+		target = ws.world.GetUnit(targetGuid)
 		if target == nil {
 			fmt.Printf("找不到目标 GUID: %d\n", targetGuid)
 			ws.SendSpellFailure(player, spellId, "无效目标")
@@ -659,8 +959,11 @@ func (ws *WorldSession) HandleCancelCastOpcode(packet *WorldPacket) {
 
 	player := ws.GetPlayer()
 	if player != nil {
-		player.InterruptSpell(CURRENT_GENERIC_SPELL)
+		if unit, ok := player.(*Unit); ok {
+			unit.InterruptSpell(CURRENT_GENERIC_SPELL)
+		}
 	}
+
 }
 
 // HandleCancelChannellingOpcode 处理取消引导操作码
@@ -669,13 +972,113 @@ func (ws *WorldSession) HandleCancelChannellingOpcode(packet *WorldPacket) {
 
 	player := ws.GetPlayer()
 	if player != nil {
-		player.InterruptSpell(CURRENT_CHANNELED_SPELL)
+		if unit, ok := player.(*Unit); ok {
+			unit.InterruptSpell(CURRENT_CHANNELED_SPELL)
+		}
 	}
+
 }
 
 // HandleKeepAliveOpcode 处理保持连接操作码
 func (ws *WorldSession) HandleKeepAliveOpcode(packet *WorldPacket) {
 	ws.ResetTimeOutTime(true)
+}
+
+// HandleDamageTakenOpcode 处理受到伤害操作码
+func (ws *WorldSession) HandleDamageTakenOpcode(packet *WorldPacket) {
+	targetGuid := packet.ReadUint64()
+	damage := packet.ReadUint32()
+
+	player := ws.GetPlayer()
+	if player == nil || player.GetGUID() != targetGuid {
+		return
+	}
+
+	fmt.Printf("玩家 %s 受到伤害: %d\n", ws.GetPlayerInfo(), damage)
+
+	// 处理伤害
+	oldHealth := player.GetHealth()
+	newHealth := oldHealth
+	if oldHealth > damage {
+		newHealth = oldHealth - damage
+	} else {
+		newHealth = 1 // 保持至少1点血
+	}
+
+	player.SetHealth(newHealth)
+
+	// 发送血量更新给客户端
+	ws.SendHealthUpdate(player, newHealth, player.GetMaxHealth())
+
+	// 广播血量更新给其他玩家
+	ws.world.BroadcastHealthUpdate(player, oldHealth, newHealth)
+
+	// 添加批量更新 - 基于AzerothCore的血量同步
+	if unit, ok := player.(*Unit); ok {
+		unit.AddBatchUpdateForFullState() // 血量变化需要完整状态更新
+	}
+
+	// 使用oldHealth避免编译警告
+	_ = oldHealth
+
+}
+
+// HandleMoveStartForwardOpcode 处理开始前进操作码 - 基于AzerothCore的移动同步
+func (ws *WorldSession) HandleMoveStartForwardOpcode(packet *WorldPacket) {
+	// 读取移动数据
+	x := packet.ReadFloat32()
+	y := packet.ReadFloat32()
+	z := packet.ReadFloat32()
+	orientation := packet.ReadFloat32()
+
+	player := ws.GetPlayer()
+	if player == nil {
+		return
+	}
+
+	fmt.Printf("玩家 %s 开始前进到位置: (%.2f, %.2f, %.2f), 朝向: %.2f\n",
+		ws.GetPlayerInfo(), x, y, z, orientation)
+
+	// 更新玩家位置
+	if unit, ok := player.(*Unit); ok {
+		unit.SetPosition(x, y, z)
+		unit.orientation = orientation
+
+		// 添加批量更新 - 基于AzerothCore的移动同步
+		unit.AddBatchUpdateForMovement() // 移动需要位置更新
+
+		fmt.Printf("[BatchUpdate] 移动更新: %s 位置(%.2f, %.2f, %.2f)\n",
+			unit.GetName(), x, y, z)
+	}
+}
+
+// HandleMoveStopOpcode 处理停止移动操作码 - 基于AzerothCore的移动同步
+func (ws *WorldSession) HandleMoveStopOpcode(packet *WorldPacket) {
+	// 读取停止位置数据
+	x := packet.ReadFloat32()
+	y := packet.ReadFloat32()
+	z := packet.ReadFloat32()
+	orientation := packet.ReadFloat32()
+
+	player := ws.GetPlayer()
+	if player == nil {
+		return
+	}
+
+	fmt.Printf("玩家 %s 停止移动在位置: (%.2f, %.2f, %.2f), 朝向: %.2f\n",
+		ws.GetPlayerInfo(), x, y, z, orientation)
+
+	// 更新玩家位置
+	if unit, ok := player.(*Unit); ok {
+		unit.SetPosition(x, y, z)
+		unit.orientation = orientation
+
+		// 添加批量更新 - 基于AzerothCore的移动同步
+		unit.AddBatchUpdateForMovement() // 停止移动也需要位置更新
+
+		fmt.Printf("[BatchUpdate] 停止移动更新: %s 位置(%.2f, %.2f, %.2f)\n",
+			unit.GetName(), x, y, z)
+	}
 }
 
 // === 服务器数据包发送方法 ===
@@ -770,5 +1173,38 @@ func (ws *WorldSession) SendSpellEnergizeLog(caster, target IUnit, spellId, amou
 	packet.WriteUint32(spellId)
 	packet.WriteUint32(amount)
 	packet.WriteUint32(uint32(powerType))
+	ws.SendPacket(packet)
+}
+
+// GetNextReceivedPacket 获取下一个接收到的数据包（用于客户端处理）
+func (ws *WorldSession) GetNextReceivedPacket() *WorldPacket {
+	select {
+	case packet := <-ws._receivedQueue:
+		return packet
+	default:
+		return nil
+	}
+}
+
+// QueueReceivedPacket 将数据包加入客户端接收队列
+func (ws *WorldSession) QueueReceivedPacket(packet *WorldPacket) {
+	if ws._receivedQueue == nil {
+		return
+	}
+
+	select {
+	case ws._receivedQueue <- packet:
+		// 成功加入队列
+	default:
+		fmt.Printf("会话 %d 客户端接收队列已满，丢弃数据包: 0x%X\n", ws.id, packet.GetOpcode())
+	}
+}
+
+// SendHealthUpdate 发送血量更新
+func (ws *WorldSession) SendHealthUpdate(unit IUnit, health, maxHealth uint32) {
+	packet := NewWorldPacket(SMSG_HEALTH_UPDATE)
+	packet.WriteUint64(unit.GetGUID())
+	packet.WriteUint32(health)
+	packet.WriteUint32(maxHealth)
 	ws.SendPacket(packet)
 }
